@@ -30,8 +30,30 @@ The original command also works once dependencies are installed:
 uv run python scripts/import.py
 ```
 
-The interface uses Qt instead of Tkinter; a separate Tk installation is no longer
-needed. No web service, account, upload, or Lightroom plugin is involved.
+The desktop interface uses Qt instead of Tkinter; a separate Tk installation is
+no longer needed. No web service, account, or upload is involved.
+
+## Lightroom Classic plug-in
+
+You can also run the importer from **File → Plug-in Extras → Import from camera…**
+in Lightroom Classic on macOS. Choose a source, destination, and optional date
+cutoff, review the preview, then copy and automatically add the completed media
+to the current catalog. The plug-in uses the same copy engine as the desktop app.
+
+Build the self-contained plug-in for your Mac:
+
+```sh
+uv run --with pyinstaller python scripts/build_lightroom_plugin.py
+```
+
+In Lightroom Classic, use **File → Plug-in Manager → Add** and select
+`dist/CameraTools.lrplugin`. The built plug-in includes Python and ExifRead; it
+does not need a separate Python or uv installation. See the
+[plug-in guide](lightroom/README.md) for installation, recovery, and validation.
+
+The helper and Lua integration are tested automatically with a simulated SDK.
+The native Lightroom dialogs and real catalog behavior still need an in-app
+check; Lightroom Classic is not installed on the development machine.
 
 ## Import
 
@@ -130,10 +152,14 @@ Add `--copy` to perform the import. Other options: `--photos-only` and
 ```sh
 uv sync
 uv run python -m unittest discover -s tests -v
+uv run --with lupa python -m unittest discover -s tests -v
 ```
 
 The core tests use temporary directories, including cancellation, date boundaries,
 repeat imports, and filename conflicts. UI tests run with Qt's offscreen platform.
+The second command also runs the Lightroom Lua 5.1 integration tests using Lupa;
+without Lupa those tests are skipped. It does not require Lightroom or modify a
+real catalog.
 
 Implementation references: [Qt for Python](https://doc.qt.io/qtforpython-6/) and
 [ExifRead](https://pypi.org/project/ExifRead/).

@@ -90,6 +90,15 @@ class ImportResult:
     errors: list[str] = field(default_factory=list)
     cancelled: bool = False
     bytes_copied: int = 0
+    files: list[ImportedFile] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ImportedFile:
+    """An actual destination that was copied or verified as an identical file."""
+
+    path: Path
+    kind: str
 
 
 @dataclass(frozen=True)
@@ -560,6 +569,8 @@ def import_media(
     # Keep the preview's canonical destination: a newly introduced symlink is an error.
     if options.destination != scan.options.destination:
         raise ValueError("The destination changed since the preview; scan again.")
+    if options.source != scan.options.source:
+        raise ValueError("The source changed since the preview; scan again.")
     total = scan.total_bytes
     done = 0
     cache: dict = {}
@@ -704,6 +715,9 @@ def import_media(
                     result.bytes_copied += item.size
                     if planned.relative_destination.name != item.relative_destination.name:
                         result.renamed += 1
+                result.files.append(ImportedFile(
+                    options.destination / planned.relative_destination, item.kind,
+                ))
             except (OSError, ValueError) as exc:
                 result.errors.append(f"{item.source.name}: {exc}")
             finally:
