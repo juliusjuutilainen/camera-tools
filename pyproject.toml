@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camera-tools"
+version = "0.2.0"
+description = "A local photo importer that keeps JPEG, RAW, and sidecars together."
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.8,<7", "ExifRead>=3.5,<4"]
+
+[project.scripts]
+camera-import = "camera_tools.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["camera_tools*"]
