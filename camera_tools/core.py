@@ -652,13 +652,12 @@ def _renamed_path(relative: Path, number: int) -> Path:
     return relative.with_name(f"{stem}__{number}{tail}")
 
 
-def _publish_temp(directory: _Directory, temporary_name: str, final_name: str) -> None:
-    """Publish atomically, refusing to replace even a file created a moment ago."""
-    if directory.descriptor is None:
-        # Windows MoveFileEx without REPLACE_EXISTING: os.rename never overwrites.
-        os.rename(directory.path / temporary_name, directory.path / final_name)
-    elif sys.platform == "darwin":
-        # Apple renameatx_np(..., RENAME_EXCL) also works on volumes without links.
+_UNSUPPORTED_ERRNOS = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM, errno.EINVAL}
+
+
+def _exclusive_rename(directory: _Directory, temporary_name: str, final_name: str) -> None:
+    """Atomic no-replace publication where the filesystem offers one (APFS, HFS+, ext4)."""
+    if sys.platform == "darwin":
         function = ctypes.CDLL(None, use_errno=True).renameatx_np
         function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         function.restype = ctypes.c_int
@@ -672,6 +671,38 @@ def _publish_temp(directory: _Directory, temporary_name: str, final_name: str) -
             src_dir_fd=directory.descriptor, dst_dir_fd=directory.descriptor, follow_symlinks=False,
         )
         os.unlink(temporary_name, dir_fd=directory.descriptor)
+
+
+def _checked_rename(directory: _Directory, temporary_name: str, final_name: str) -> None:
+    """exFAT and FAT have neither exclusive rename nor hard links: check, then rename.
+
+    The window between the check and the rename is microseconds, and the caller
+    verified the name a moment earlier, so this is as close to no-replace as those
+    filesystems allow.
+    """
+    try:
+        directory.stat(final_name)
+    except FileNotFoundError:
+        os.rename(
+            temporary_name, final_name,
+            src_dir_fd=directory.descriptor, dst_dir_fd=directory.descriptor,
+        )
+    else:
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), final_name)
+
+
+def _publish_temp(directory: _Directory, temporary_name: str, final_name: str) -> None:
+    """Publish without replacing an existing file, even one created a moment ago."""
+    if directory.descriptor is None:
+        # Windows MoveFileEx without REPLACE_EXISTING: os.rename never overwrites.
+        os.rename(directory.path / temporary_name, directory.path / final_name)
+        return
+    try:
+        _exclusive_rename(directory, temporary_name, final_name)
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_ERRNOS:
+            raise
+        _checked_rename(directory, temporary_name, final_name)
 
 
 def _copy_file(

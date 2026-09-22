@@ -1,5 +1,6 @@
 """Behavior and file-safety tests; all imports use disposable fixtures."""
 
+import errno
 import os
 import tempfile
 import threading
@@ -466,6 +467,32 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((result.copied, result.renamed, result.errors), (1, 1, []))
         self.assertEqual(outside.read_bytes(), b"do not change")
         self.assertEqual(self.output("IMG_0001__2.JPG").read_bytes(), b"jpeg")
+
+    def test_filesystems_without_exclusive_rename_fall_back_to_checked_rename(self):
+        # exFAT and FAT (cards, shared external drives) reject RENAME_EXCL and hard links.
+        self.photo()
+        self.photo("DCIM/100CAM/IMG_0001.RAF", b"raw")
+        unsupported = OSError(errno.ENOTSUP, "Operation not supported")
+        with patch.object(core, "_exclusive_rename", side_effect=unsupported):
+            result = import_media(scan_media(self.options()))
+        self.assertEqual((result.copied, result.errors), (2, []))
+        self.assertEqual(self.output("IMG_0001.JPG").read_bytes(), b"jpeg")
+        self.assertEqual(list(self.destination.rglob("*.tmp")), [])
+        # The fallback still refuses to replace a file that appeared after the check.
+        checked = core._checked_rename
+
+        def collide(directory, temporary_name, final_name):
+            descriptor = directory.open(final_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+            checked(directory, temporary_name, final_name)
+
+        self.photo("DCIM/100CAM/IMG_0002.JPG", b"second")
+        with patch.object(core, "_exclusive_rename", side_effect=unsupported), patch.object(core, "_checked_rename", side_effect=collide):
+            result = import_media(scan_media(self.options()))
+        self.assertEqual((result.copied, result.skipped), (0, 2))
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(self.output("IMG_0002.JPG").read_bytes(), b"")
+        self.assertEqual(list(self.destination.rglob("*.tmp")), [])
 
     def test_late_destination_collision_is_never_overwritten(self):
         self.photo()

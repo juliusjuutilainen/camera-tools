@@ -130,7 +130,9 @@ Pictures/
 - Scanning and copying run off the UI thread. Physical transfer speed still
   depends on the card, reader, and destination.
 - Copies are written to temporary files in the destination, then published
-  without overwriting existing photos. File timestamps are preserved.
+  without overwriting existing photos. File timestamps are preserved. exFAT and
+  FAT drives have no exclusive rename, so the publish there checks the name and
+  renames; other filesystems use an atomic no-replace rename.
 - Cancellation removes the active temporary copy. Completed files remain;
   preview and import again to resume. The card is never erased or modified.
 - Source changes after preview, disconnected cards, insufficient free space, and
