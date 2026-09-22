@@ -31,10 +31,12 @@ cutoff is inclusive. Capture dates fall back to modification dates when absent;
 the preview shows the fallback count and any scan warnings.
 
 **Import files** copies the exact preview snapshot. Changed or disconnected
-sources are reported. The existing engine preserves RAW/JPEG/sidecar filenames,
-uses matching suffixes for conflicts, and verifies existing matching files by
-content. The preview displays the proposed paths; collision suffixes are chosen
-during copying. Sidecars are copied beside their media and are not added as
+sources are reported. The preview shows each file's status against its date
+folder: *New*, *Already present* (same name and size; verified by content and
+never copied again), or *Name in use* (a different file has the name; the copy
+gets a suffix such as `__2`). Each file is judged on its own; RAW, JPEG and
+sidecars do not share a verdict. Collision suffixes are chosen during copying.
+Sidecars are copied beside their media and are not added as
 separate catalog entries. The plug-in does not change Lightroom's RAW/JPEG
 preferences or create catalog stacks. Lightroom decides which file formats it
 can add; a rejected file remains on disk and is listed in the report.

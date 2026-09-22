@@ -25,10 +25,15 @@ class CommandLineTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(main(arguments), 0)
             self.assertIn("Preview only", output.getvalue())
+            self.assertIn("[modified] New", output.getvalue())
             self.assertFalse(destination.exists())
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(main(arguments + ["--copy"]), 0)
             self.assertEqual((destination / "2026/09/20/PHOTO.JPG").read_bytes(), photo.read_bytes())
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(arguments), 0)
+            self.assertIn("1 already present", output.getvalue())
+            self.assertIn("[modified] Already present", output.getvalue())
 
     def test_missing_source_error_is_actionable(self):
         with redirect_stderr(io.StringIO()) as error:

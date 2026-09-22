@@ -72,6 +72,8 @@ class LightroomBridgeTests(unittest.TestCase):
         self.assertIn("PHOTO | 2026-09-19 13:30:00", preview["preview_text"])
         self.assertIn("5 bytes", preview["preview_text"])
         self.assertIn("2026/09/19/", preview["preview_text"])
+        self.assertTrue(preview["preview_text"].splitlines()[1].endswith(" | New"))
+        self.assertEqual((preview["present"], preview["taken"], preview["bytes_to_copy"]), (0, 0, 5))
         self.assertFalse(self.destination.exists())
         self.photo("LATER.JPG")
         # Copy uses the snapshot, regardless of changes to the request options.
@@ -86,25 +88,48 @@ class LightroomBridgeTests(unittest.TestCase):
         progress = json.loads((self.job / "progress.json").read_text())
         self.assertEqual((progress["phase"], progress["completed"], progress["total"]), ("copy", 5, 5))
 
-    def test_collisions_return_actual_pair_paths_and_exclude_sidecars(self):
+    def test_collisions_rename_only_the_colliding_file_and_exclude_sidecars(self):
         self.photo("IMG.JPG", b"new jpeg")
         self.photo("IMG.RAF", b"new raw")
         self.photo("IMG.JPG.xmp", b"edits")
         self.photo("CLIP.MOV", b"video")
         self.output().parent.mkdir(parents=True)
         self.output().write_bytes(b"other jpeg")
-        self.run_helper("preview")
+        preview = self.run_helper("preview")
+        self.assertEqual((preview["present"], preview["taken"]), (0, 1))
+        self.assertIn('"IMG.JPG" | PHOTO', preview["preview_text"])
+        self.assertIn("| Name in use", preview["preview_text"])
         result = self.run_helper("copy")
-        self.assertEqual((result["copied"], result["renamed"], result["errors"]), (4, 3, []))
+        self.assertEqual((result["copied"], result["renamed"], result["errors"]), (4, 1, []))
+        self.assertEqual(len(result["notes"]), 1)
+        self.assertIn("IMG__2.JPG", result["notes"][0])
         self.assertEqual({(entry["path"], entry["kind"]) for entry in result["files"]}, {
             (str(self.output("IMG__2.JPG")), "photo"),
-            (str(self.output("IMG__2.RAF")), "raw"),
+            (str(self.output("IMG.RAF")), "raw"),
             (str(self.output("CLIP.MOV")), "video"),
         })
-        self.assertTrue(self.output("IMG__2.JPG.xmp").exists())
+        self.assertTrue(self.output("IMG.JPG.xmp").exists())
         repeated = self.run_helper("copy")
         self.assertEqual((repeated["copied"], repeated["skipped"], repeated["errors"]), (0, 4, []))
         self.assertEqual(repeated["files"], result["files"])
+
+    def test_preview_reports_files_already_present_and_copy_skips_them(self):
+        self.photo("IMG.JPG", b"photo")
+        self.photo("IMG.RAF", b"raw data")
+        self.output().parent.mkdir(parents=True)
+        self.output().write_bytes(b"photo")
+        preview = self.run_helper("preview")
+        self.assertEqual((preview["count"], preview["present"], preview["taken"]), (2, 1, 0))
+        self.assertEqual((preview["total_bytes"], preview["bytes_to_copy"]), (13, 8))
+        self.assertIn('"IMG.JPG" | PHOTO', preview["preview_text"])
+        self.assertIn("| Already present", preview["preview_text"])
+        snapshot = json.loads((self.job / "preview.json").read_text())
+        self.assertEqual({row["source"].rsplit("/", 1)[1]: (row["status"], row["existing_size"]) for row in snapshot["items"]}, {
+            "IMG.JPG": ("present", 5), "IMG.RAF": ("new", None),
+        })
+        copied = self.run_helper("copy")
+        self.assertEqual((copied["copied"], copied["skipped"], copied["renamed"], copied["errors"]), (1, 1, 0, []))
+        self.assertEqual({entry["path"] for entry in copied["files"]}, {str(self.output()), str(self.output("IMG.RAF"))})
 
     def test_shared_duplicate_path_is_listed_once(self):
         self.photo("A/IMG.JPG")
@@ -289,7 +314,7 @@ class LightroomBridgeTests(unittest.TestCase):
             ("relative_destination", "../../outside.JPG"),
             ("source", str(self.root / "outside.JPG")),
             ("mtime_ns", None), ("inode", 123.5), ("device", True),
-            ("size", -1), ("kind", "executable"),
+            ("size", -1), ("kind", "executable"), ("status", "maybe"), ("existing_size", "5"),
         ]
         for key, value in mutations:
             with self.subTest(field=key):

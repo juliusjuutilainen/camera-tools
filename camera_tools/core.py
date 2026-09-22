@@ -2,7 +2,8 @@
 
 Scanning never reads entire files or writes to the library. Capture dates are camera
 wall-clock dates, so timezone conversion cannot move a photograph to another day.
-RAW/JPEG pairs and their sidecars share a date and any collision suffix.
+RAW/JPEG pairs and their sidecars share a date; duplicates and name collisions are
+judged file by file against the planned date folder, and the preview reports them.
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ VIDEO_EXTENSIONS = frozenset({
 })
 SIDECAR_EXTENSIONS = frozenset({".xmp", ".aae"})
 COPY_CHUNK_SIZE = 4 * 1024 * 1024
+# Preview status of a file against its planned date folder (stat only, no hashing).
+STATUS_NEW = "new"            # No file with this name in the date folder.
+STATUS_PRESENT = "present"    # Same name and size: verified by content and skipped.
+STATUS_TAKEN = "taken"        # Same name, different file: copied with a suffix.
+STATUS_LABELS = {STATUS_NEW: "New", STATUS_PRESENT: "Already present", STATUS_TAKEN: "Name in use"}
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,8 @@ class MediaItem:
     group_id: str = ""
     device: int | None = field(default=None, repr=False)
     inode: int | None = field(default=None, repr=False)
+    status: str = STATUS_NEW
+    existing_size: int | None = None
 
 
 @dataclass
@@ -81,6 +89,23 @@ class ScanResult:
     def total_bytes(self) -> int:
         return sum(item.size for item in self.items)
 
+    @property
+    def present_count(self) -> int:
+        return sum(1 for item in self.items if item.status == STATUS_PRESENT)
+
+    @property
+    def taken_count(self) -> int:
+        return sum(1 for item in self.items if item.status == STATUS_TAKEN)
+
+    @property
+    def import_count(self) -> int:
+        """Files the import will copy: everything not already present."""
+        return len(self.items) - self.present_count
+
+    @property
+    def bytes_to_copy(self) -> int:
+        return sum(item.size for item in self.items if item.status != STATUS_PRESENT)
+
 
 @dataclass
 class ImportResult:
@@ -91,6 +116,7 @@ class ImportResult:
     cancelled: bool = False
     bytes_copied: int = 0
     files: list[ImportedFile] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -342,10 +368,75 @@ def scan_media(
                     result.fallback_count += 1
             if progress:
                 progress(found, f"Reading dates · {media[0].path.name}")
+        result.items = _mark_existing(result.items, options.destination, result.warnings, cancel, progress, found)
     except _Cancelled:
         result.cancelled = True
     result.items.sort(key=lambda item: (str(item.relative_destination.parent), str(item.source)))
     return result
+
+
+def _existing_entries(directory: int) -> dict[str, dict[str, int | None]]:
+    """Case-folded name -> {actual name: size of a regular file, None otherwise}."""
+    entries: dict[str, dict[str, int | None]] = defaultdict(dict)
+    with os.scandir(directory) as listing:
+        for entry in listing:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            entries[entry.name.casefold()][entry.name] = info.st_size if stat.S_ISREG(info.st_mode) else None
+    return entries
+
+
+def _lookup(entries: dict[str, dict[str, int | None]], name: str) -> tuple[str, int | None] | None:
+    """Find a name as a case-insensitive destination disk would, preferring an exact match."""
+    variants = entries.get(name.casefold())
+    if not variants:
+        return None
+    actual = name if name in variants else min(variants)
+    return actual, variants[actual]
+
+
+def _mark_existing(
+    items: list[MediaItem],
+    destination: Path,
+    warnings: list[str],
+    cancel: Event | None,
+    progress: Callable[[int, str], None] | None,
+    found: int,
+) -> list[MediaItem]:
+    """Compare each file with its planned date folder by name and size; read nothing."""
+    if not destination.is_dir():
+        return items
+    listings: dict[Path, dict[str, dict[str, int | None]] | None] = {}
+    marked: list[MediaItem] = []
+    for item in items:
+        folder = item.relative_destination.parent
+        if folder not in listings:
+            _check_cancel(cancel)
+            if progress:
+                progress(found, f"Checking existing files · {folder}")
+            try:
+                directory = _open_directory(destination / folder, create=False)
+            except FileNotFoundError:
+                listings[folder] = {}
+            except (OSError, ValueError) as exc:
+                warnings.append(f"Cannot check existing files in {folder}: {exc}")
+                listings[folder] = None
+            else:
+                try:
+                    listings[folder] = _existing_entries(directory)
+                finally:
+                    os.close(directory)
+        entries = listings[folder]
+        existing = _lookup(entries, item.relative_destination.name) if entries is not None else None
+        if existing is None:
+            marked.append(item)
+            continue
+        _, size = existing
+        status = STATUS_PRESENT if size == item.size else STATUS_TAKEN
+        marked.append(replace(item, status=status, existing_size=size))
+    return marked
 
 
 def _same_snapshot(item: MediaItem, info: os.stat_result) -> bool:
@@ -462,21 +553,6 @@ def _renamed_path(relative: Path, number: int) -> Path:
     return relative.with_name(f"{stem}__{number}{tail}")
 
 
-def _split_case_collisions(members: list[MediaItem]) -> list[list[MediaItem]]:
-    """Separate case-only duplicate names before targeting a case-insensitive disk."""
-    lanes: list[list[MediaItem]] = []
-    for item in sorted(members, key=lambda member: (_base_stem(member.source), member.source.name)):
-        stem = _base_stem(item.source)
-        preferred = sorted(lanes, key=lambda lane: not any(_base_stem(member.source) == stem for member in lane))
-        for lane in preferred:
-            if all(member.relative_destination.name.casefold() != item.relative_destination.name.casefold() for member in lane):
-                lane.append(item)
-                break
-        else:
-            lanes.append([item])
-    return lanes
-
-
 def _publish_temp(directory: int, temporary_name: str, final_name: str) -> None:
     """Publish atomically, refusing to replace even a file created a moment ago."""
     if sys.platform == "darwin":
@@ -574,15 +650,12 @@ def import_media(
     total = scan.total_bytes
     done = 0
     cache: dict = {}
-    groups: dict[tuple[str, Path], list[MediaItem]] = defaultdict(list)
     for item in scan.items:
         relative = item.relative_destination
         if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 4:
             raise ValueError("The preview contains an unsafe destination path.")
         if not item.source.is_relative_to(options.source):
             raise ValueError("The preview contains a file outside the source folder.")
-        group_id = item.group_id or str(item.source.parent / _base_stem(item.source).casefold())
-        groups[(group_id, relative.parent)].append(item)
 
     def report(message: str) -> None:
         if progress:
@@ -590,8 +663,7 @@ def import_media(
 
     plans: list[_PlannedItem] = []
     reservations: dict[str, _PlannedItem] = {}
-    reserved_stems: set[tuple[Path, str]] = set()
-    existing_stems: dict[Path, set[str]] = {}
+    listings: dict[Path, dict[str, dict[str, int | None]]] = {}
     required = 0
     try:
         _check_cancel(cancel)
@@ -600,85 +672,56 @@ def import_media(
             return result
         root = _open_directory(options.destination)
         try:
-            import_groups = [
-                (date_folder, lane)
-                for (_, date_folder), members in groups.items()
-                for lane in _split_case_collisions(members)
-            ]
-            for date_folder, members in import_groups:
+            # Every file is judged on its own against its date folder: an identical
+            # file is reused, a different file with the same name yields a suffix.
+            # JPEG, RAW and sidecars never drag each other into a rename.
+            for item in scan.items:
                 _check_cancel(cancel)
-                report(f"Checking duplicates · {members[0].source.name}")
+                report(f"Checking duplicates · {item.source.name}")
                 directory = None
                 try:
-                    for item in members:
-                        _check_source(item)
+                    _check_source(item)
+                    date_folder = item.relative_destination.parent
                     directory = _open_directory(options.destination / date_folder)
-                    if date_folder not in existing_stems:
-                        with os.scandir(directory) as entries:
-                            existing_stems[date_folder] = {
-                                _base_stem(Path(entry.name)).casefold()
-                                for entry in entries if _kind(Path(entry.name)) is not None
-                            }
+                    if date_folder not in listings:
+                        listings[date_folder] = _existing_entries(directory)
+                    entries = listings[date_folder]
                     number = 1
                     while True:
                         _check_cancel(cancel)
-                        candidates = [
-                            _PlannedItem(item, _renamed_path(item.relative_destination, number))
-                            for item in members
-                        ]
-                        statuses: list[bool | None] = []
-                        anchors: set[str] = set()
-                        conflict = False
-                        for index, planned in enumerate(candidates):
-                            relative = planned.relative_destination
-                            reserved = reservations.get(str(relative).casefold())
-                            if reserved is not None:
-                                matches = (
-                                    reserved.item.size == planned.item.size
-                                    and _source_digest(reserved.item, cache, cancel)
-                                    == _source_digest(planned.item, cache, cancel)
-                                )
-                                if matches:
-                                    # Also share one actual filename on case-sensitive disks.
-                                    candidates[index] = _PlannedItem(planned.item, reserved.relative_destination)
-                            else:
-                                matches = _existing_matches(directory, relative.name, planned.item, cache, cancel)
-                            if matches is False:
-                                conflict = True
+                        relative = _renamed_path(item.relative_destination, number)
+                        key = str(relative).casefold()
+                        reserved = reservations.get(key)
+                        if reserved is not None:
+                            if (
+                                reserved.item.size == item.size
+                                and _source_digest(reserved.item, cache, cancel)
+                                == _source_digest(item, cache, cancel)
+                            ):
+                                # Identical sources share the copy planned earlier in this run.
+                                plans.append(_PlannedItem(item, reserved.relative_destination))
                                 break
-                            if matches is True and planned.item.kind != "sidecar":
-                                anchors.add(_base_stem(relative).casefold())
-                            statuses.append(matches)
-                        candidate_stems = {
-                            _base_stem(planned.relative_destination).casefold()
-                            for planned in candidates
-                        }
-                        if not conflict:
-                            # A disjoint extension isn't proof of the same photograph.
-                            # Adding a JPEG beside an unrelated existing RAW would make
-                            # Lightroom pair two different shots. Only an identical
-                            # shared media file can establish an existing group's identity.
-                            conflict = any(
-                                stem not in anchors and (
-                                    stem in existing_stems[date_folder]
-                                    or (date_folder, stem) in reserved_stems
-                                )
-                                for stem in candidate_stems
-                            )
-                        if not conflict:
-                            for planned, matches in zip(candidates, statuses):
-                                key = str(planned.relative_destination).casefold()
-                                if matches is None and key not in reservations:
-                                    required += planned.item.size
-                                reservations[key] = planned
-                                plans.append(planned)
-                            reserved_stems.update((date_folder, stem) for stem in candidate_stems)
+                            number += 1
+                            continue
+                        existing = _lookup(entries, relative.name)
+                        matches = None
+                        if existing is not None:
+                            matches = _existing_matches(directory, existing[0], item, cache, cancel)
+                        if matches is None:
+                            planned = _PlannedItem(item, relative)
+                            reservations[key] = planned
+                            plans.append(planned)
+                            required += item.size
+                            break
+                        if matches:
+                            # Report the name the disk actually has, as Lightroom sees it.
+                            plans.append(_PlannedItem(item, relative.with_name(existing[0])))
                             break
                         number += 1
                 except (OSError, ValueError) as exc:
-                    result.errors.extend(f"{item.source.name}: {exc}" for item in members)
-                    done += sum(item.size for item in members)
-                    report(f"Could not prepare {members[0].source.name}")
+                    result.errors.append(f"{item.source.name}: {exc}")
+                    done += item.size
+                    report(f"Could not prepare {item.source.name}")
                 finally:
                     if directory is not None:
                         os.close(directory)
@@ -715,6 +758,10 @@ def import_media(
                     result.bytes_copied += item.size
                     if planned.relative_destination.name != item.relative_destination.name:
                         result.renamed += 1
+                        result.notes.append(
+                            f"{item.source.name} copied as {planned.relative_destination.name}: "
+                            "a different file already has its name."
+                        )
                 result.files.append(ImportedFile(
                     options.destination / planned.relative_destination, item.kind,
                 ))

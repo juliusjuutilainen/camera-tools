@@ -111,8 +111,9 @@ end
 
 local function previewDialog(context, preview, catalog)
     local f = LrView.osFactory()
-    local notes = string.format('%d files • %.1f MiB • %d excluded by filters',
-        preview.count, preview.total_bytes / (1024 * 1024), preview.filtered)
+    local notes = string.format('%d files • %d already present • %d names in use • %.1f MiB to copy • %d excluded by filters',
+        preview.count, preview.present or 0, preview.taken or 0,
+        (preview.bytes_to_copy or preview.total_bytes) / (1024 * 1024), preview.filtered)
     if preview.fallback_count > 0 then
         notes = notes .. string.format('\n%d files use modification dates because capture dates were unavailable.', preview.fallback_count)
     end
@@ -129,7 +130,7 @@ local function previewDialog(context, preview, catalog)
             f:static_text { title = 'Catalog: ' .. catalog:getPath(), width_in_chars = 90, height_in_lines = 2 },
             pagedText(context, details),
             f:static_text {
-                title = 'Identical files are reused. Filename conflicts receive matching suffixes for RAW, JPEG and sidecars.\nCancelling the copy keeps completed files and adds those files to this catalog.',
+                title = 'Each file is judged on its own: a file already present in its date folder is verified and never copied again; a different file with the same name gets a suffix.\nCancelling the copy keeps completed files and adds those files to this catalog.',
                 width_in_chars = 90, height_in_lines = 3,
             },
         },

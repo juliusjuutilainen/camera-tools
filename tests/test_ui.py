@@ -80,10 +80,23 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertEqual(len(list((self.destination / "2026/09/20").iterdir())), 3)
         self.assertFalse(self.window.import_button.isEnabled())
         self.click_scan()
+        statuses = {self.window.model.data(self.window.model.index(row, 2)) for row in range(3)}
+        self.assertEqual(statuses, {"Already present"})
+        self.assertEqual(self.window.import_button.text(), "Verify existing files")
+        self.assertEqual(self.window.count.text(), "0")
+        self.assertIn("3 already present", self.window.preview_note.text())
         self.window.start_import()
         self.wait_for(lambda: self.window.task is None)
         self.assertIn("3 already present", self.window.activity.text())
+        (self.destination / "2026/09/20/DSC001.NEF").write_bytes(b"a different photo with the same name")
+        self.photo("DSC002.JPG")
         self.click_scan()
+        statuses = {self.window.model.data(self.window.model.index(row, 0)): self.window.model.data(self.window.model.index(row, 2)) for row in range(4)}
+        self.assertEqual(statuses, {
+            "DSC001.JPG": "Already present", "DSC001.NEF": "Name in use",
+            "DSC001.xmp": "Already present", "DSC002.JPG": "New",
+        })
+        self.assertEqual(self.window.import_button.text(), "Import 2 files")
         self.window.videos.setChecked(False)
         self.assertIsNone(self.window.scan)
         self.assertFalse(self.window.import_button.isEnabled())

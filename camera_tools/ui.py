@@ -15,7 +15,9 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableView, QVBoxLayout, QWidget,
 )
 
-from .core import ImportOptions, discover_sources, import_media, scan_media
+from .core import (
+    STATUS_LABELS, STATUS_PRESENT, STATUS_TAKEN, ImportOptions, discover_sources, import_media, scan_media,
+)
 
 
 def human_size(value):
@@ -50,7 +52,7 @@ class Task(QThread):
 
 
 class PreviewModel(QAbstractTableModel):
-    headers = ("Filename", "Type", "Date", "Size", "Destination")
+    headers = ("Filename", "Type", "Status", "Date", "Size", "Destination")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,16 +79,27 @@ class PreviewModel(QAbstractTableModel):
             return None
         item = self.items[index.row()]
         if role == Qt.ItemDataRole.ToolTipRole:
-            return f"{item.source}\nDate: {item.date_source}\n{item.relative_destination}"
+            return f"{item.source}\nDate: {item.date_source}\n{item.relative_destination}\n{status_hint(item)}"
         if role == Qt.ItemDataRole.ForegroundRole and index.column() == 1:
             return QColor("#8dddd1")
+        if role == Qt.ItemDataRole.ForegroundRole and index.column() == 2:
+            return QColor({STATUS_PRESENT: "#9fa7b6", STATUS_TAKEN: "#f0c674"}.get(item.status, "#c4f3ec"))
         if role == Qt.ItemDataRole.DisplayRole:
             return (
-                item.source.name, item.source.suffix.lstrip(".").upper(),
+                item.source.name, item.source.suffix.lstrip(".").upper(), STATUS_LABELS[item.status],
                 item.taken_at.strftime("%d %b %Y"), human_size(item.size),
                 str(item.relative_destination),
             )[index.column()]
         return None
+
+
+def status_hint(item):
+    if item.status == STATUS_PRESENT:
+        return "A file with this name and size is already in the date folder. It is verified by content and skipped."
+    if item.status == STATUS_TAKEN:
+        existing = "a folder or link" if item.existing_size is None else human_size(item.existing_size)
+        return f"A different file ({existing}) already has this name. This copy gets a suffix such as __2."
+    return "No file with this name is in the date folder yet."
 
 
 STYLE = """
@@ -237,7 +250,7 @@ class ImportWindow(QMainWindow):
         self.videos = QCheckBox("Include videos")
         self.videos.setChecked(self.settings.value("videos", True, type=bool))
         left.addWidget(self.videos)
-        left.addWidget(label("Matching files are checked before skipping. Different photos with the same name are kept.", "Muted", True))
+        left.addWidget(label("Files already in the date folder are never copied again. Different photos with the same name are kept.", "Muted", True))
         left.addStretch()
         self.preview_button = QPushButton("Preview import")
         self.preview_button.clicked.connect(self.start_scan)
@@ -256,7 +269,7 @@ class ImportWindow(QMainWindow):
         self.count = label("—", "Metric")
         self.size_metric = label("—", "Metric")
         self.days = label("—", "Metric")
-        for metric, caption in ((self.count, "files in preview"), (self.size_metric, "to check / copy"), (self.days, "date folders")):
+        for metric, caption in ((self.count, "files to import"), (self.size_metric, "to copy"), (self.days, "date folders")):
             column = QVBoxLayout()
             column.addWidget(metric)
             column.addWidget(label(caption, "Muted"))
@@ -279,7 +292,7 @@ class ImportWindow(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for column, width in enumerate((160, 62, 104, 85)):
+        for column, width in enumerate((160, 62, 128, 104, 85)):
             self.table.setColumnWidth(column, width)
         right.addWidget(self.table, 1)
         self.table.hide()
@@ -465,24 +478,35 @@ class ImportWindow(QMainWindow):
         self.table.setVisible(bool(scan.items))
         self.empty.setVisible(not scan.items)
         self.empty.setText("No matching photos or videos.\nCheck your source and cutoff date.")
-        self.count.setText(f"{len(scan.items):,}")
-        self.size_metric.setText(human_size(scan.total_bytes))
+        self.count.setText(f"{scan.import_count:,}")
+        self.size_metric.setText(human_size(scan.bytes_to_copy))
         self.days.setText(str(len({item.relative_destination.parent for item in scan.items})))
         counts = Counter(item.kind for item in scan.items)
         description = " · ".join(f"{count:,} {kind}" for kind, count in sorted(counts.items()))
-        notes = [description] if description else []
+        notes = [f"{len(scan.items):,} files in preview · {description}"] if description else []
+        if scan.present_count:
+            notes.append(f"{scan.present_count:,} already present in the destination · skipped after a content check")
+        if scan.taken_count:
+            notes.append(f"{scan.taken_count:,} names already used by different files · copied with a suffix")
         if scan.filtered:
             notes.append(f"{scan.filtered:,} excluded by filters")
         if scan.fallback_count:
             notes.append(f"{scan.fallback_count:,} files use modified dates (capture date unavailable)")
-        notes.append("Identical files are skipped during import; name conflicts receive matching suffixes.")
+        notes.append("Each file is judged on its own; an identical file is never copied twice.")
         self.preview_note.setText("\n".join(notes))
         if scan.warnings:
             self.details.setPlainText("\n".join(scan.warnings))
             self.details.show()
-        self.status.setText("Preview ready" if scan.items else "Nothing to import")
-        self.activity.setText("Review the dates and destinations, then import." if scan.items else "Try a different folder or earlier date.")
-        self.import_button.setText(f"Import {len(scan.items):,} files")
+        if not scan.items:
+            self.status.setText("Nothing to import")
+            self.activity.setText("Try a different folder or earlier date.")
+        elif scan.import_count:
+            self.status.setText("Preview ready")
+            self.activity.setText("Review the statuses and destinations, then import.")
+        else:
+            self.status.setText("Everything is already present")
+            self.activity.setText("Import verifies the existing files by content; nothing new is copied.")
+        self.import_button.setText(f"Import {scan.import_count:,} files" if scan.import_count else "Verify existing files")
 
     def start_import(self):
         if not self.scan or self.task:
@@ -497,8 +521,8 @@ class ImportWindow(QMainWindow):
         self.status.setText(title)
         self.activity.setText(f"{result.copied:,} copied · {result.skipped:,} already present · {result.renamed:,} renamed · {len(result.errors):,} errors")
         self.preview_note.setText("Completed files are in your destination. In Lightroom Classic, use Import → Add and choose that folder.")
-        if result.errors:
-            self.details.setPlainText("\n".join(result.errors))
+        if result.errors or result.notes:
+            self.details.setPlainText("\n".join(result.errors + result.notes))
             self.details.show()
         self.open_folder.setVisible(Path(self.destination.text()).expanduser().is_dir())
         self.scan = None

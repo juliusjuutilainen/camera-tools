@@ -17,7 +17,7 @@ def main(argv=None):
     parser.add_argument("--photos-only", action="store_true")
     parser.add_argument("--copy", action="store_true", help="Copy after scanning; otherwise only preview")
     args = parser.parse_args(argv)
-    from .core import ImportOptions, discover_sources, import_media, scan_media
+    from .core import STATUS_LABELS, ImportOptions, discover_sources, import_media, scan_media
 
     if args.list_devices:
         devices = discover_sources()
@@ -43,9 +43,12 @@ def main(argv=None):
             cutoff=args.since, include_videos=not args.photos_only, date_basis=args.date_basis,
         )
         scan = scan_media(options)
-        print(f"{len(scan.items):,} files · {scan.total_bytes / (1024 ** 2):,.1f} MiB · {scan.filtered:,} excluded by filters")
+        print(
+            f"{len(scan.items):,} files · {scan.present_count:,} already present · "
+            f"{scan.bytes_to_copy / (1024 ** 2):,.1f} MiB to copy · {scan.filtered:,} excluded by filters"
+        )
         for item in scan.items[:30]:
-            print(f"  {item.source.name} → {item.relative_destination} [{item.date_source}]")
+            print(f"  {item.source.name} → {item.relative_destination} [{item.date_source}] {STATUS_LABELS[item.status]}")
         if len(scan.items) > 30:
             print(f"  … and {len(scan.items) - 30:,} more")
         for warning in scan.warnings:
@@ -61,6 +64,8 @@ def main(argv=None):
         finally:
             signal.signal(signal.SIGINT, previous)
         print(f"Copied {result.copied:,}; already present {result.skipped:,}; renamed {result.renamed:,}.")
+        for note in result.notes:
+            print(note)
         for error in result.errors:
             print(error, file=sys.stderr)
         return 130 if result.cancelled else (1 if result.errors else 0)

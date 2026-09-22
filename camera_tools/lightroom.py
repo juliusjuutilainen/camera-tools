@@ -19,7 +19,9 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
-from .core import ImportOptions, MediaItem, ScanResult, discover_sources, import_media, scan_media
+from .core import (
+    STATUS_LABELS, ImportOptions, MediaItem, ScanResult, discover_sources, import_media, scan_media,
+)
 
 
 PROTOCOL = 1
@@ -135,6 +137,7 @@ def _save_preview(path: Path, scan: ScanResult) -> None:
             "date_source": item.date_source, "kind": item.kind,
             "mtime_ns": item.mtime_ns, "group_id": item.group_id,
             "device": item.device, "inode": item.inode,
+            "status": item.status, "existing_size": item.existing_size,
         } for item in scan.items],
         "filtered": scan.filtered, "warnings": scan.warnings,
         "fallback_count": scan.fallback_count, "cancelled": scan.cancelled,
@@ -179,6 +182,12 @@ def _load_preview(path: Path) -> ScanResult:
             raise ValueError("The saved preview contains an invalid photo date.") from None
         if taken_at.tzinfo is not None:
             raise ValueError("The saved preview photo date must use camera wall-clock time.")
+        status = _text(row.get("status"), "Preview status")
+        if status not in STATUS_LABELS:
+            raise ValueError("The saved preview contains an invalid file status.")
+        existing_size = row.get("existing_size")
+        if existing_size is not None:
+            existing_size = _integer(existing_size, "Preview existing size")
         items.append(MediaItem(
             source=source, relative_destination=relative,
             size=_integer(row.get("size"), "Preview size"), taken_at=taken_at,
@@ -187,6 +196,7 @@ def _load_preview(path: Path) -> ScanResult:
             group_id=_text(row.get("group_id"), "Preview group", empty=True),
             device=_integer(row.get("device"), "Preview device"),
             inode=_integer(row.get("inode"), "Preview inode"),
+            status=status, existing_size=existing_size,
         ))
     warnings = value.get("warnings")
     if not isinstance(warnings, list) or not all(isinstance(item, str) for item in warnings):
@@ -237,14 +247,14 @@ class _Progress:
 
 
 def _preview_text(scan: ScanResult) -> str:
-    lines = ["Filename | Type | Date | Date source | Size | Destination (relative)"]
+    lines = ["Filename | Type | Date | Date source | Size | Destination (relative) | Status"]
     for item in scan.items:
         # JSON-style quoting preserves newlines and tabs in unusual filenames.
         filename = json.dumps(item.source.name, ensure_ascii=False)
         destination = json.dumps(str(item.relative_destination), ensure_ascii=False)
         lines.append(
             f"{filename} | {item.kind.upper()} | {item.taken_at.isoformat(sep=' ')} | "
-            f"{item.date_source} | {item.size:,} bytes | {destination}"
+            f"{item.date_source} | {item.size:,} bytes | {destination} | {STATUS_LABELS[item.status]}"
         )
     if not scan.items:
         lines.append("No matching files.")
@@ -274,6 +284,7 @@ def run_job(job: Path) -> dict:
         response.update(
             source=str(scan.options.source), destination=str(scan.options.destination),
             count=count, total_bytes=scan.total_bytes, filtered=scan.filtered,
+            present=scan.present_count, taken=scan.taken_count, bytes_to_copy=scan.bytes_to_copy,
             fallback_count=scan.fallback_count, warnings=scan.warnings,
             cancelled=scan.cancelled, preview_text=_preview_text(scan),
         )
@@ -289,7 +300,7 @@ def run_job(job: Path) -> dict:
                 seen.add(item.path)
         response.update(
             copied=result.copied, skipped=result.skipped, renamed=result.renamed,
-            cancelled=result.cancelled, errors=result.errors, files=files,
+            cancelled=result.cancelled, errors=result.errors, notes=result.notes, files=files,
         )
         # Keep accurate partial progress on cancellation or failures.
         message = "Copy cancelled" if result.cancelled else "Copy finished"

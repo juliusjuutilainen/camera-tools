@@ -160,7 +160,34 @@ class ImportTests(unittest.TestCase):
             result = import_media(preview)
         self.assertEqual((result.copied, result.errors), (1, []))
 
-    def test_conflicting_pair_gets_common_suffix_and_rerun_is_idempotent(self):
+    def test_preview_reports_present_taken_and_new_without_reading_content(self):
+        self.photo("DCIM/100CAM/IMG_0001.JPG", b"jpeg")
+        self.photo("DCIM/100CAM/IMG_0001.RAF", b"raw")
+        self.photo("DCIM/100CAM/IMG_0002.JPG", b"other")
+        self.output("IMG_0001.JPG").parent.mkdir(parents=True)
+        self.output("IMG_0001.JPG").write_bytes(b"JPEG")  # Same size; content is checked at import.
+        self.output("img_0001.raf").write_bytes(b"different size")  # Case-insensitive name match.
+        with patch.object(core, "_digest", side_effect=AssertionError("Preview must not hash")):
+            preview = scan_media(self.options())
+        self.assertEqual({item.source.name: (item.status, item.existing_size) for item in preview.items}, {
+            "IMG_0001.JPG": ("present", 4), "IMG_0001.RAF": ("taken", 14), "IMG_0002.JPG": ("new", None),
+        })
+        self.assertEqual((preview.present_count, preview.taken_count, preview.import_count), (1, 1, 2))
+        self.assertEqual((preview.bytes_to_copy, preview.total_bytes), (3 + 5, 4 + 3 + 5))
+        self.assertEqual(preview.warnings, [])
+
+    def test_preview_warns_when_a_date_folder_cannot_be_checked(self):
+        self.photo()
+        outside = self.root / "outside"
+        outside.mkdir()
+        date_folder = self.output("IMG_0001.JPG").parent
+        date_folder.parent.mkdir(parents=True)
+        date_folder.symlink_to(outside, target_is_directory=True)
+        preview = scan_media(self.options())
+        self.assertEqual(preview.items[0].status, "new")
+        self.assertTrue(any("Cannot check existing files" in warning for warning in preview.warnings))
+
+    def test_conflicting_file_gets_suffix_alone_and_rerun_is_idempotent(self):
         self.photo()
         self.photo("DCIM/100CAM/IMG_0001.RAF", b"raw")
         self.photo("DCIM/100CAM/IMG_0001.JPG.xmp", b"metadata")
@@ -168,25 +195,32 @@ class ImportTests(unittest.TestCase):
         existing.parent.mkdir(parents=True)
         existing.write_bytes(b"old!")  # Same size, different contents.
         preview = scan_media(self.options())
+        self.assertEqual({item.source.name: item.status for item in preview.items}, {
+            "IMG_0001.JPG": "present", "IMG_0001.RAF": "new", "IMG_0001.JPG.xmp": "new",
+        })
         result = import_media(preview)
-        self.assertEqual((result.copied, result.renamed, result.errors), (3, 3, []))
+        self.assertEqual((result.copied, result.renamed, result.errors), (3, 1, []))
         self.assertEqual(existing.read_bytes(), b"old!")
         self.assertEqual(self.output("IMG_0001__2.JPG").read_bytes(), b"jpeg")
-        self.assertEqual(self.output("IMG_0001__2.RAF").read_bytes(), b"raw")
-        self.assertEqual(self.output("IMG_0001__2.JPG.xmp").read_bytes(), b"metadata")
+        self.assertEqual(self.output("IMG_0001.RAF").read_bytes(), b"raw")
+        self.assertEqual(self.output("IMG_0001.JPG.xmp").read_bytes(), b"metadata")
+        self.assertEqual(len(result.notes), 1)
+        self.assertIn("IMG_0001__2.JPG", result.notes[0])
         again = import_media(preview)
         self.assertEqual((again.copied, again.skipped, again.errors), (0, 3, []))
         self.assertFalse(self.output("IMG_0001__3.JPG").exists())
 
-    def test_partial_existing_pair_does_not_split_when_raw_collides(self):
+    def test_partial_existing_pair_is_judged_file_by_file(self):
         self.photo()
         self.photo("DCIM/100CAM/IMG_0001.RAF", b"raw")
         self.output("IMG_0001.JPG").parent.mkdir(parents=True)
         self.output("IMG_0001.JPG").write_bytes(b"jpeg")
-        self.output("IMG_0001.RAF").write_bytes(b"old")
-        result = import_media(scan_media(self.options()))
-        self.assertEqual((result.copied, result.renamed, result.skipped), (2, 2, 0))
-        self.assertEqual(self.output("IMG_0001__2.JPG").read_bytes(), b"jpeg")
+        self.output("IMG_0001.RAF").write_bytes(b"old")  # Same size, different contents.
+        preview = scan_media(self.options())
+        self.assertEqual({item.status for item in preview.items}, {"present"})
+        result = import_media(preview)
+        self.assertEqual((result.copied, result.renamed, result.skipped), (1, 1, 1))
+        self.assertFalse(self.output("IMG_0001__2.JPG").exists())
         self.assertEqual(self.output("IMG_0001__2.RAF").read_bytes(), b"raw")
 
     def test_same_names_in_two_camera_folders_keep_both_pairs(self):
@@ -201,32 +235,31 @@ class ImportTests(unittest.TestCase):
         again = import_media(preview)
         self.assertEqual((again.copied, again.skipped, again.errors), (0, 4, []))
 
-    def test_disjoint_formats_from_different_folders_do_not_form_false_pair(self):
+    def test_disjoint_formats_from_different_folders_are_imported_independently(self):
         self.photo("100CAM/IMG_0001.JPG", b"shot one")
         self.photo("101CAM/IMG_0001.NEF", b"different shot")
         preview = scan_media(self.options())
         result = import_media(preview)
-        self.assertEqual((result.copied, result.renamed, result.errors), (2, 1, []))
+        self.assertEqual((result.copied, result.renamed, result.errors), (2, 0, []))
         self.assertEqual(self.output("IMG_0001.JPG").read_bytes(), b"shot one")
-        self.assertFalse(self.output("IMG_0001.NEF").exists())
-        self.assertEqual(self.output("IMG_0001__2.NEF").read_bytes(), b"different shot")
+        self.assertEqual(self.output("IMG_0001.NEF").read_bytes(), b"different shot")
         again = import_media(preview)
         self.assertEqual((again.copied, again.skipped, again.errors), (0, 2, []))
 
-    def test_unrelated_existing_raw_reserves_basename_for_new_jpeg(self):
+    def test_existing_raw_does_not_rename_a_new_jpeg(self):
         self.photo()
         raw = self.output("IMG_0001.NEF")
         raw.parent.mkdir(parents=True)
         raw.write_bytes(b"unrelated existing raw")
         preview = scan_media(self.options())
+        self.assertEqual(preview.items[0].status, "new")
         result = import_media(preview)
-        self.assertEqual((result.copied, result.renamed, result.errors), (1, 1, []))
-        self.assertFalse(self.output("IMG_0001.JPG").exists())
-        self.assertEqual(self.output("IMG_0001__2.JPG").read_bytes(), b"jpeg")
+        self.assertEqual((result.copied, result.renamed, result.errors), (1, 0, []))
+        self.assertEqual(self.output("IMG_0001.JPG").read_bytes(), b"jpeg")
         self.assertEqual(raw.read_bytes(), b"unrelated existing raw")
         self.assertEqual(import_media(preview).skipped, 1)
 
-    def test_shared_identical_media_anchor_can_complete_existing_pair(self):
+    def test_existing_jpeg_is_skipped_and_its_new_raw_is_added(self):
         self.photo()
         self.photo("DCIM/100CAM/IMG_0001.RAF", b"raw")
         jpeg = self.output("IMG_0001.JPG")
@@ -236,7 +269,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((result.copied, result.skipped, result.renamed, result.errors), (1, 1, 0, []))
         self.assertEqual(self.output("IMG_0001.RAF").read_bytes(), b"raw")
 
-    def test_matching_sidecar_alone_does_not_establish_media_identity(self):
+    def test_identical_sidecar_is_skipped_while_its_photo_is_new(self):
         self.photo()
         self.photo("DCIM/100CAM/IMG_0001.xmp", b"common edit settings")
         existing = self.output("IMG_0001.NEF")
@@ -244,9 +277,10 @@ class ImportTests(unittest.TestCase):
         existing.write_bytes(b"unrelated raw")
         self.output("IMG_0001.xmp").write_bytes(b"common edit settings")
         result = import_media(scan_media(self.options()))
-        self.assertEqual((result.copied, result.renamed, result.errors), (2, 2, []))
-        self.assertTrue(self.output("IMG_0001__2.JPG").exists())
-        self.assertTrue(self.output("IMG_0001__2.xmp").exists())
+        self.assertEqual((result.copied, result.skipped, result.renamed, result.errors), (1, 1, 0, []))
+        self.assertEqual(self.output("IMG_0001.JPG").read_bytes(), b"jpeg")
+        self.assertFalse(self.output("IMG_0001__2.JPG").exists())
+        self.assertFalse(self.output("IMG_0001__2.xmp").exists())
 
     def test_identical_files_from_multiple_folders_share_verified_copy(self):
         self.photo("A/IMG.JPG", b"same")

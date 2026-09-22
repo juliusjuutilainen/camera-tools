@@ -64,8 +64,11 @@ check; Lightroom Classic is not installed on the development machine.
 2. Choose the root of your existing photo library, such as `~/Pictures`.
 3. Optionally enable **Only on or after** and select the earliest date to include.
    The selected day is included, starting at midnight.
-4. Click **Preview import**. Check filenames, dates, sizes, and destination paths.
-5. Click **Import files**. Progress and cancellation remain available throughout.
+4. Click **Preview import**. Check filenames, dates, sizes, destination paths, and
+   the **Status** column: *New*, *Already present* (a file with the same name and
+   size is in that date folder), or *Name in use* (a different file has the name).
+5. Click **Import files**. Only new files are copied; progress and cancellation
+   remain available throughout.
 6. In Lightroom Classic, use **Import → Add** on the destination folder to add the
    copied files to your catalog. The importer does not edit the Lightroom catalog.
 
@@ -90,7 +93,8 @@ Pictures/
 - **File modified date** retains the old importer's date source. Choose it if you
   need to match an existing library organized with the old script. Switching date
   sources can put the same photograph in a different date folder; duplicate
-  detection is within each target date folder, not across your whole library.
+  detection compares each file with its own target date folder, not with the
+  whole library.
 - The date source controls both the cutoff and destination folder. Paired photos
   from the same source directory share one date, preferring the JPEG's capture
   metadata. Sidecars inherit their photo's date. With no capture metadata, the
@@ -102,15 +106,25 @@ Pictures/
 
 ### Duplicates, safety, and speed
 
+- Every file is judged on its own against its target date folder. The preview
+  lists each planned date folder (names and sizes only, nothing is read or hashed)
+  and marks a file **Already present** when a file with the same name and size is
+  there, or **Name in use** when a different file has that name. Matching is
+  case-insensitive, like the destination disk.
+- During import, an *Already present* file is compared by content (SHA-256) with
+  the existing copy. Identical files are never copied again. A different file
+  with the same name, and every *Name in use* file, is copied with a suffix such
+  as `DSC01234__2.JPG`; the import report lists these renames.
+- JPEG, RAW, and sidecars are not coupled for duplicate handling: if the JPEG is
+  already present and the RAW is new, only the RAW is copied, without a suffix.
+  After a camera filename reset a new JPEG can therefore land beside an unrelated
+  RAW of the same name in the same day; the preview shows both statuses.
 - Scanning reads directory entries and date metadata without hashing every photo
   or extracting thumbnails. The table handles large previews without creating a
   widget for every row.
 - Scanning and copying run off the UI thread. Physical transfer speed still
-  depends on the card, reader, and destination. Re-importing verifies existing
-  matching files by content, so it can take longer than the old name-only skip.
-- Existing files with matching names and sizes are compared by content during
-  import. Identical files are skipped. Different files receive a suffix such as
-  `DSC01234__2.JPG`, with the same suffix used for the RAW and sidecars.
+  depends on the card, reader, and destination. Re-importing verifies present
+  files by content, so it can take longer than a name-only skip.
 - Copies are written to temporary files in the destination, then published
   without overwriting existing photos. File timestamps are preserved.
 - Cancellation removes the active temporary copy. Completed files remain;
@@ -144,8 +158,10 @@ Preview without copying:
 uv run camera-import --source /Volumes/CAMERA --destination ~/Pictures --since 2026-09-01
 ```
 
-Add `--copy` to perform the import. Other options: `--photos-only` and
-`--date-basis modified`. Ctrl+C requests safe cancellation during copying.
+The preview prints each file's status (`New`, `Already present`, `Name in use`)
+and how many bytes the import would copy. Add `--copy` to perform the import.
+Other options: `--photos-only` and `--date-basis modified`. Ctrl+C requests safe
+cancellation during copying.
 
 ## Development
 
