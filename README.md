@@ -114,10 +114,12 @@ Pictures/
   and marks a file **Already present** when a file with the same name and size is
   there, or **Name in use** when a different file has that name. Matching is
   case-insensitive, like the destination disk.
-- During import, an *Already present* file is compared by content (SHA-256) with
-  the existing copy. Identical files are never copied again. A different file
-  with the same name, and every *Name in use* file, is copied with a suffix such
-  as `DSC01234__2.JPG`; the import report lists these renames.
+- During import, an *Already present* file whose modification time also matches
+  (within 2 seconds, to allow for FAT card timestamps) is skipped without being
+  read, so re-importing a full card takes seconds. A size match with a different
+  time is compared by content (SHA-256). Identical files are never copied again.
+  A different file with the same name, and every *Name in use* file, is copied
+  with a suffix such as `DSC01234__2.JPG`; the import report lists these renames.
 - JPEG, RAW, and sidecars are not coupled for duplicate handling: if the JPEG is
   already present and the RAW is new, only the RAW is copied, without a suffix.
   After a camera filename reset a new JPEG can therefore land beside an unrelated
@@ -126,8 +128,7 @@ Pictures/
   or extracting thumbnails. The table handles large previews without creating a
   widget for every row.
 - Scanning and copying run off the UI thread. Physical transfer speed still
-  depends on the card, reader, and destination. Re-importing verifies present
-  files by content, so it can take longer than a name-only skip.
+  depends on the card, reader, and destination.
 - Copies are written to temporary files in the destination, then published
   without overwriting existing photos. File timestamps are preserved.
 - Cancellation removes the active temporary copy. Completed files remain;

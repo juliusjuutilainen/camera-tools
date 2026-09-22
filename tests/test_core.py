@@ -153,6 +153,28 @@ class ImportTests(unittest.TestCase):
             again = import_media(preview)
         self.assertEqual((again.copied, again.skipped, again.errors), (0, 2, []))
 
+    def test_present_file_with_matching_time_is_skipped_without_reading(self):
+        self.photo()
+        self.photo("DCIM/100CAM/IMG_0001.RAF", b"raw")
+        preview = scan_media(self.options())
+        self.assertEqual(import_media(preview).copied, 2)
+        with patch.object(core, "_digest", side_effect=AssertionError("Unneeded hashing")):
+            again = import_media(preview)
+        self.assertEqual((again.copied, again.skipped, again.errors), (0, 2, []))
+        # A stamp within FAT's 2-second granularity still counts; beyond that, content decides.
+        existing = self.output("IMG_0001.JPG")
+        stamp = existing.stat().st_mtime + 1
+        os.utime(existing, (stamp, stamp))
+        with patch.object(core, "_digest", side_effect=AssertionError("Unneeded hashing")):
+            self.assertEqual(import_media(preview).skipped, 2)
+        stamp += 2
+        os.utime(existing, (stamp, stamp))
+        existing.write_bytes(b"JPEG")
+        os.utime(existing, (stamp, stamp))
+        result = import_media(preview)
+        self.assertEqual((result.copied, result.skipped, result.renamed), (1, 1, 1))
+        self.assertEqual(self.output("IMG_0001__2.JPG").read_bytes(), b"jpeg")
+
     def test_no_hashing_when_destination_names_are_new(self):
         self.photo()
         preview = scan_media(self.options())

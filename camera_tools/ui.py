@@ -95,7 +95,7 @@ class PreviewModel(QAbstractTableModel):
 
 def status_hint(item):
     if item.status == STATUS_PRESENT:
-        return "A file with this name and size is already in the date folder. It is verified by content and skipped."
+        return "A file with this name and size is already in the date folder. It is skipped when its modification time matches too, otherwise compared by content."
     if item.status == STATUS_TAKEN:
         existing = "a folder or link" if item.existing_size is None else human_size(item.existing_size)
         return f"A different file ({existing}) already has this name. This copy gets a suffix such as __2."
@@ -485,7 +485,7 @@ class ImportWindow(QMainWindow):
         description = " · ".join(f"{count:,} {kind}" for kind, count in sorted(counts.items()))
         notes = [f"{len(scan.items):,} files in preview · {description}"] if description else []
         if scan.present_count:
-            notes.append(f"{scan.present_count:,} already present in the destination · skipped after a content check")
+            notes.append(f"{scan.present_count:,} already present in the destination · skipped")
         if scan.taken_count:
             notes.append(f"{scan.taken_count:,} names already used by different files · copied with a suffix")
         if scan.filtered:

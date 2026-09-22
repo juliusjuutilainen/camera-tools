@@ -40,6 +40,9 @@ VIDEO_EXTENSIONS = frozenset({
 SIDECAR_EXTENSIONS = frozenset({".xmp", ".aae"})
 COPY_CHUNK_SIZE = 4 * 1024 * 1024
 _WINDOWS = sys.platform == "win32"
+# A present file with the same size and a modification time this close is trusted
+# without reading it (the copy preserved timestamps; FAT cards keep 2-second stamps).
+MTIME_TOLERANCE_NS = 2 * 1_000_000_000
 # Windows os.open defaults to text mode, which would rewrite bytes inside photos.
 _O_BINARY = getattr(os, "O_BINARY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -613,13 +616,19 @@ def _source_digest(item: MediaItem, cache: dict, cancel: Event | None) -> bytes:
 def _existing_matches(
     directory: _Directory, name: str, item: MediaItem, cache: dict, cancel: Event | None,
 ) -> bool | None:
-    """None means absent; false includes symlinks and non-file collisions."""
+    """None means absent; false includes symlinks and non-file collisions.
+
+    Same size and modification time is the quick check that lets a re-import of a
+    full card finish in seconds; only a size match with another time is hashed.
+    """
     try:
         info = directory.stat(name)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode) or info.st_size != item.size:
         return False
+    if item.mtime_ns is not None and abs(info.st_mtime_ns - item.mtime_ns) <= MTIME_TOLERANCE_NS:
+        return True
     source_digest = _source_digest(item, cache, cancel)
     descriptor = directory.open(name, os.O_RDONLY)
     try:
