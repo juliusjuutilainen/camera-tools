@@ -691,6 +691,13 @@ def _checked_rename(directory: _Directory, temporary_name: str, final_name: str)
         raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), final_name)
 
 
+def _step(step: str, exc: OSError) -> OSError:
+    """Keep errno and class (FileExistsError stays FileExistsError), name the step."""
+    if exc.errno is None:
+        return OSError(f"{exc} while {step}")
+    return type(exc)(exc.errno, f"{exc.strerror} while {step}", exc.filename)
+
+
 def _publish_temp(directory: _Directory, temporary_name: str, final_name: str) -> None:
     """Publish without replacing an existing file, even one created a moment ago."""
     if directory.descriptor is None:
@@ -739,16 +746,30 @@ def _copy_file(
         _check_source(item)
         times = (source_info.st_atime_ns, source_info.st_mtime_ns)
         if directory.descriptor is not None:
-            os.fchmod(temporary, stat.S_IMODE(source_info.st_mode))
-            os.utime(temporary, ns=times)
+            try:
+                os.fchmod(temporary, stat.S_IMODE(source_info.st_mode))
+            except OSError as exc:
+                # FAT-family volumes have no permission bits worth failing over.
+                if exc.errno not in _UNSUPPORTED_ERRNOS:
+                    raise _step("setting permissions", exc)
+            try:
+                os.utime(temporary, ns=times)
+            except OSError as exc:
+                raise _step("setting timestamps", exc)
         os.fsync(temporary)
         os.close(temporary)
         temporary = None
         if directory.descriptor is None:
             # Windows refuses path-based utime while another handle is open.
-            os.utime(directory.path / temporary_name, ns=times)
+            try:
+                os.utime(directory.path / temporary_name, ns=times)
+            except OSError as exc:
+                raise _step("setting timestamps", exc)
         _check_cancel(cancel)
-        _publish_temp(directory, temporary_name, name)
+        try:
+            _publish_temp(directory, temporary_name, name)
+        except OSError as exc:
+            raise _step("publishing the copy", exc)
         directory.sync()
     finally:
         os.close(source)
