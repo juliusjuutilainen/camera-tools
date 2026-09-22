@@ -450,7 +450,7 @@ class ImportTests(unittest.TestCase):
         publish = core._publish_temp
 
         def collide(directory, temporary_name, final_name):
-            descriptor = os.open(final_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+            descriptor = directory.open(final_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 os.write(descriptor, b"other import")
             finally:

@@ -12,6 +12,7 @@ import ctypes
 import errno
 import hashlib
 import os
+import shutil
 import stat
 import sys
 import uuid
@@ -38,6 +39,10 @@ VIDEO_EXTENSIONS = frozenset({
 })
 SIDECAR_EXTENSIONS = frozenset({".xmp", ".aae"})
 COPY_CHUNK_SIZE = 4 * 1024 * 1024
+_WINDOWS = sys.platform == "win32"
+# Windows os.open defaults to text mode, which would rewrite bytes inside photos.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 # Preview status of a file against its planned date folder (stat only, no hashing).
 STATUS_NEW = "new"            # No file with this name in the date folder.
 STATUS_PRESENT = "present"    # Same name and size: verified by content and skipped.
@@ -293,6 +298,9 @@ def scan_media(
                         result.filtered += 1
                         continue
                     info = entry.stat(follow_symlinks=False)
+                    if _WINDOWS:
+                        # DirEntry.stat() leaves st_dev and st_ino at zero on Windows.
+                        info = os.lstat(path)
                     groups[(path.parent, _base_stem(path).casefold())].append(
                         _Candidate(path, info, kind)
                     )
@@ -375,10 +383,11 @@ def scan_media(
     return result
 
 
-def _existing_entries(directory: int | Path) -> dict[str, dict[str, int | None]]:
+def _existing_entries(directory: _Directory | Path) -> dict[str, dict[str, int | None]]:
     """Case-folded name -> {actual name: size of a regular file, None otherwise}."""
     entries: dict[str, dict[str, int | None]] = defaultdict(dict)
-    with os.scandir(directory) as listing:
+    listing = directory.scandir() if isinstance(directory, _Directory) else os.scandir(directory)
+    with listing:
         for entry in listing:
             try:
                 info = entry.stat(follow_symlinks=False)
@@ -439,13 +448,16 @@ def _mark_existing(
     return marked
 
 
-def _same_snapshot(item: MediaItem, info: os.stat_result) -> bool:
+def _same_snapshot(item: MediaItem, info: os.stat_result, *, handle: bool = False) -> bool:
+    # Windows handle stats do not reliably carry the ids that lstat reported at scan
+    # time, so handle-based checks there rely on type, size and modification time.
+    identity = not (handle and _WINDOWS)
     return (
         stat.S_ISREG(info.st_mode)
         and info.st_size == item.size
         and (item.mtime_ns is None or info.st_mtime_ns == item.mtime_ns)
-        and (item.device is None or info.st_dev == item.device)
-        and (item.inode is None or info.st_ino == item.inode)
+        and (not identity or item.device is None or info.st_dev == item.device)
+        and (not identity or item.inode is None or info.st_ino == item.inode)
     )
 
 
@@ -457,9 +469,9 @@ def _check_source(item: MediaItem) -> os.stat_result:
 
 
 def _open_source(item: MediaItem) -> int:
-    descriptor = os.open(item.source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(item.source, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY)
     try:
-        if not _same_snapshot(item, os.fstat(descriptor)):
+        if not _same_snapshot(item, os.fstat(descriptor), handle=True):
             raise OSError("Source changed since the preview; scan again.")
         return descriptor
     except BaseException:
@@ -467,16 +479,94 @@ def _open_source(item: MediaItem) -> int:
         raise
 
 
-def _open_directory(path: Path, *, create: bool = True) -> int:
-    """Walk with directory handles so a destination symlink cannot redirect writes."""
+class _Directory:
+    """One destination folder.
+
+    POSIX keeps a directory descriptor so a symlink swapped in after the check cannot
+    redirect writes. Windows has no dir_fd, so it works on the validated path instead
+    and every opened file is still verified by handle before it is trusted.
+    """
+
+    def __init__(self, path: Path, descriptor: int | None):
+        self.path = path
+        self.descriptor = descriptor
+
+    def stat(self, name: str) -> os.stat_result:
+        if self.descriptor is None:
+            return os.lstat(self.path / name)
+        return os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
+
+    def open(self, name: str, flags: int, mode: int = 0o777) -> int:
+        flags |= _O_NOFOLLOW | _O_BINARY
+        if self.descriptor is None:
+            return os.open(self.path / name, flags, mode)
+        return os.open(name, flags, mode, dir_fd=self.descriptor)
+
+    def scandir(self):
+        return os.scandir(self.path if self.descriptor is None else self.descriptor)
+
+    def unlink(self, name: str) -> None:
+        if self.descriptor is None:
+            os.unlink(self.path / name)
+        else:
+            os.unlink(name, dir_fd=self.descriptor)
+
+    def sync(self) -> None:
+        if self.descriptor is None:
+            return  # Windows cannot flush a directory; the file itself was flushed.
+        try:
+            os.fsync(self.descriptor)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
+
+    def free_bytes(self) -> int:
+        if self.descriptor is None:
+            return shutil.disk_usage(self.path).free
+        info = os.fstatvfs(self.descriptor)
+        return info.f_bavail * info.f_frsize
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    attributes = getattr(info, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _open_directory(path: Path, *, create: bool = True) -> _Directory:
+    """Walk to a destination folder so a symlink cannot redirect writes.
+
+    POSIX walks with directory handles and O_NOFOLLOW. Windows checks every component
+    with lstat and refuses symbolic links and junctions.
+    """
     if not path.is_absolute():
         raise ValueError("Destination paths must be absolute.")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if any(part in {".", ".."} for part in path.parts[1:]):
+        raise ValueError("Destination paths cannot contain traversal components.")
+    if _WINDOWS:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current = current / part
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(current)
+                except FileExistsError:
+                    pass
+                info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode) or _is_reparse_point(info):
+                raise OSError(f"{current} is a link or not a folder.")
+        return _Directory(path, None)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _O_NOFOLLOW
     descriptor = os.open(path.anchor, flags)
     try:
         for part in path.parts[1:]:
-            if part in {".", ".."}:
-                raise ValueError("Destination paths cannot contain traversal components.")
             try:
                 child = os.open(part, flags, dir_fd=descriptor)
             except FileNotFoundError:
@@ -489,7 +579,7 @@ def _open_directory(path: Path, *, create: bool = True) -> int:
                 child = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
-        return descriptor
+        return _Directory(path, descriptor)
     except BaseException:
         os.close(descriptor)
         raise
@@ -512,7 +602,7 @@ def _source_digest(item: MediaItem, cache: dict, cancel: Event | None) -> bytes:
         descriptor = _open_source(item)
         try:
             digest = _digest(descriptor, cancel)
-            if not _same_snapshot(item, os.fstat(descriptor)):
+            if not _same_snapshot(item, os.fstat(descriptor), handle=True):
                 raise OSError("Source changed while checking duplicates; scan again.")
             cache[key] = digest
         finally:
@@ -521,17 +611,17 @@ def _source_digest(item: MediaItem, cache: dict, cancel: Event | None) -> bytes:
 
 
 def _existing_matches(
-    directory: int, name: str, item: MediaItem, cache: dict, cancel: Event | None,
+    directory: _Directory, name: str, item: MediaItem, cache: dict, cancel: Event | None,
 ) -> bool | None:
     """None means absent; false includes symlinks and non-file collisions."""
     try:
-        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        info = directory.stat(name)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode) or info.st_size != item.size:
         return False
     source_digest = _source_digest(item, cache, cancel)
-    descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory)
+    descriptor = directory.open(name, os.O_RDONLY)
     try:
         before = os.fstat(descriptor)
         key = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
@@ -553,25 +643,31 @@ def _renamed_path(relative: Path, number: int) -> Path:
     return relative.with_name(f"{stem}__{number}{tail}")
 
 
-def _publish_temp(directory: int, temporary_name: str, final_name: str) -> None:
+def _publish_temp(directory: _Directory, temporary_name: str, final_name: str) -> None:
     """Publish atomically, refusing to replace even a file created a moment ago."""
-    if sys.platform == "darwin":
+    if directory.descriptor is None:
+        # Windows MoveFileEx without REPLACE_EXISTING: os.rename never overwrites.
+        os.rename(directory.path / temporary_name, directory.path / final_name)
+    elif sys.platform == "darwin":
         # Apple renameatx_np(..., RENAME_EXCL) also works on volumes without links.
         function = ctypes.CDLL(None, use_errno=True).renameatx_np
         function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         function.restype = ctypes.c_int
-        if function(directory, os.fsencode(temporary_name), directory, os.fsencode(final_name), 0x4):
+        if function(directory.descriptor, os.fsencode(temporary_name), directory.descriptor, os.fsencode(final_name), 0x4):
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), final_name)
     else:
         # A hard link is an atomic, no-replace publication on POSIX filesystems.
-        os.link(temporary_name, final_name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
-        os.unlink(temporary_name, dir_fd=directory)
+        os.link(
+            temporary_name, final_name,
+            src_dir_fd=directory.descriptor, dst_dir_fd=directory.descriptor, follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=directory.descriptor)
 
 
 def _copy_file(
     item: MediaItem,
-    directory: int,
+    directory: _Directory,
     name: str,
     cancel: Event | None,
     advanced: Callable[[int], None],
@@ -582,10 +678,7 @@ def _copy_file(
     temporary = None
     try:
         source_info = os.fstat(source)
-        temporary = os.open(
-            temporary_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600, dir_fd=directory,
-        )
+        temporary = directory.open(temporary_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         copied = 0
         while True:
             _check_cancel(cancel)
@@ -601,34 +694,34 @@ def _copy_file(
             copied += len(chunk)
             advanced(len(chunk))
         _check_cancel(cancel)
-        if copied != item.size or not _same_snapshot(item, os.fstat(source)):
+        if copied != item.size or not _same_snapshot(item, os.fstat(source), handle=True):
             raise OSError("Source changed during the copy; scan again.")
         _check_source(item)
-        os.fchmod(temporary, stat.S_IMODE(source_info.st_mode))
-        os.utime(temporary, ns=(source_info.st_atime_ns, source_info.st_mtime_ns))
+        times = (source_info.st_atime_ns, source_info.st_mtime_ns)
+        if directory.descriptor is not None:
+            os.fchmod(temporary, stat.S_IMODE(source_info.st_mode))
+            os.utime(temporary, ns=times)
         os.fsync(temporary)
         os.close(temporary)
         temporary = None
+        if directory.descriptor is None:
+            # Windows refuses path-based utime while another handle is open.
+            os.utime(directory.path / temporary_name, ns=times)
         _check_cancel(cancel)
         _publish_temp(directory, temporary_name, name)
-        try:
-            os.fsync(directory)
-        except OSError as exc:
-            if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
-                raise
+        directory.sync()
     finally:
         os.close(source)
         if temporary is not None:
             os.close(temporary)
         try:
-            os.unlink(temporary_name, dir_fd=directory)
+            directory.unlink(temporary_name)
         except FileNotFoundError:
             pass
 
 
-def _free_bytes(directory: int) -> int:
-    info = os.fstatvfs(directory)
-    return info.f_bavail * info.f_frsize
+def _free_bytes(directory: _Directory) -> int:
+    return directory.free_bytes()
 
 
 def import_media(
@@ -724,12 +817,12 @@ def import_media(
                     report(f"Could not prepare {item.source.name}")
                 finally:
                     if directory is not None:
-                        os.close(directory)
+                        directory.close()
             if required > _free_bytes(root):
                 result.errors.append(f"Not enough free space: the import needs {required:,} bytes.")
                 return result
         finally:
-            os.close(root)
+            root.close()
 
         for planned in plans:
             _check_cancel(cancel)
@@ -769,7 +862,7 @@ def import_media(
                 result.errors.append(f"{item.source.name}: {exc}")
             finally:
                 if directory is not None:
-                    os.close(directory)
+                    directory.close()
             done += item.size - advanced_bytes
             report(f"Processed {item.source.name}")
     except _Cancelled:

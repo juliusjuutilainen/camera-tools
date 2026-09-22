@@ -4,8 +4,11 @@ A local desktop importer for a Lightroom photo library. Copies photographs into
 `yyyy/mm/dd` and keeps same-name JPEG, RAW, and sidecar files together. Originals
 stay on the card.
 
-macOS is the supported platform. The filesystem engine also has Linux mount
-discovery, but Linux hardware has not been tested; Windows copying is not supported.
+macOS is the primary platform. Windows is supported for preview and import: the
+engine walks destination folders by path there, refuses symbolic links and
+junctions, and publishes each copy with a no-overwrite rename. The Lightroom
+plug-in build is macOS only. Linux mount discovery exists, but Linux hardware has
+not been tested.
 
 ## Run
 
@@ -157,6 +160,8 @@ Preview without copying:
 ```sh
 uv run camera-import --source /Volumes/CAMERA --destination ~/Pictures --since 2026-09-01
 ```
+
+On Windows the same command takes drive paths, for example `--source E:\ --destination D:\Pictures`.
 
 The preview prints each file's status (`New`, `Already present`, `Name in use`)
 and how many bytes the import would copy. Add `--copy` to perform the import.
