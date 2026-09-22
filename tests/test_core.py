@@ -176,6 +176,15 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((preview.bytes_to_copy, preview.total_bytes), (3 + 5, 4 + 3 + 5))
         self.assertEqual(preview.warnings, [])
 
+    def test_preview_check_needs_no_directory_handles(self):
+        # Windows has no dir_fd support; the read-only preview must still see existing files.
+        self.photo()
+        self.output("IMG_0001.JPG").parent.mkdir(parents=True)
+        self.output("IMG_0001.JPG").write_bytes(b"jpeg")
+        with patch.object(core, "_open_directory", side_effect=AssertionError("preview used a directory handle")):
+            preview = scan_media(self.options())
+        self.assertEqual((preview.items[0].status, preview.warnings), ("present", []))
+
     def test_preview_warns_when_a_date_folder_cannot_be_checked(self):
         self.photo()
         outside = self.root / "outside"

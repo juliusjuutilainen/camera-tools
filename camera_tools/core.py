@@ -375,7 +375,7 @@ def scan_media(
     return result
 
 
-def _existing_entries(directory: int) -> dict[str, dict[str, int | None]]:
+def _existing_entries(directory: int | Path) -> dict[str, dict[str, int | None]]:
     """Case-folded name -> {actual name: size of a regular file, None otherwise}."""
     entries: dict[str, dict[str, int | None]] = defaultdict(dict)
     with os.scandir(directory) as listing:
@@ -405,7 +405,11 @@ def _mark_existing(
     progress: Callable[[int, str], None] | None,
     found: int,
 ) -> list[MediaItem]:
-    """Compare each file with its planned date folder by name and size; read nothing."""
+    """Compare each file with its planned date folder by name and size; read nothing.
+
+    This is a read-only look, so plain paths are enough and it also works where the
+    import's directory handles are unavailable (Windows). The import re-checks safely.
+    """
     if not destination.is_dir():
         return items
     listings: dict[Path, dict[str, dict[str, int | None]] | None] = {}
@@ -416,18 +420,14 @@ def _mark_existing(
             _check_cancel(cancel)
             if progress:
                 progress(found, f"Checking existing files · {folder}")
+            path = destination / folder
             try:
-                directory = _open_directory(destination / folder, create=False)
-            except FileNotFoundError:
-                listings[folder] = {}
-            except (OSError, ValueError) as exc:
+                if path.is_symlink():
+                    raise OSError("the date folder is a symbolic link")
+                listings[folder] = _existing_entries(path) if path.is_dir() else {}
+            except OSError as exc:
                 warnings.append(f"Cannot check existing files in {folder}: {exc}")
                 listings[folder] = None
-            else:
-                try:
-                    listings[folder] = _existing_entries(directory)
-                finally:
-                    os.close(directory)
         entries = listings[folder]
         existing = _lookup(entries, item.relative_destination.name) if entries is not None else None
         if existing is None:
